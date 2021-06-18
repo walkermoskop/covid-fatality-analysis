@@ -1,0 +1,555 @@
+---
+title: "County-level analysis of COVID fatality rates in Midwestern states"
+author: "Walker Moskop"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(car)
+library(ggplot2)
+library(gridExtra)
+library(tidyr)
+library(alr4)
+library(dplyr)
+library(faraway)
+library(lme4)
+library(pbkrtest)
+library(RLRsim)
+library(broom.mixed)
+library(lattice)
+library(randomForest)
+```
+
+## Read in and prepare the data
+```{r}
+data_dir = 'data/'
+df.raw = read.csv(paste0(data_dir, 'county-all-data.csv'))
+
+### should be zero missing vals
+sum(is.na(df.raw))
+
+### narrow to only midwestern states
+mw.states = as.data.frame(c('IA', 'IL', 'IN', 'KS', 'MI', 'MN', 'MO',
+                        'NE', 'ND', 'OH', 'SD', 'WI'))
+colnames(mw.states) = c('STATE')
+
+df = merge(df.raw, mw.states, by='STATE') #inner joing to filter data
+## reset state and county factor levels since some are no longer used
+df$STATE = factor(df$STATE)
+df$COUNTY = factor(df$COUNTY)
+df$county.class = factor(df$county.class)
+```
+
+## Exploratory Analysis
+Start by looking at the distribution of the response variable, deaths per 100,000 population. It clearly has a long right tail and might benefit from a transformation.
+```{r, message=F, warning=F}
+ggplot(df, aes(x=deaths.100k)) + geom_histogram()
+
+### What do log or sq. root tranformations look like? Square root looks better
+### though the zeroes in the left tail might cause some problems.
+p1 = ggplot(df, aes(x=log1p(deaths.100k))) + geom_histogram()
+p2 = ggplot(df, aes(x=sqrt(deaths.100k))) + geom_histogram()
+grid.arrange(p1, p2, nrow=1, ncol=2)
+```
+
+Compare the relationship between the response and categorical predictors.
+```{r, message=F, warning=F}
+predictors.cat = c('stay.home.flag', 'rest.closed.flag',
+                   'bars.closed.flag', 'mask.mand.flag', 'county.class')
+p1 = ggplot(df, aes(x=stay.home.flag, y=deaths.100k)) +
+  geom_point(position = position_jitter(width=0.1, height=0.1),
+             size=0.5)
+p2 = ggplot(df, aes(x=bars.closed.flag, y=deaths.100k)) +
+  geom_point(position = position_jitter(width=0.1, height=0.1),
+             size=0.5)
+p3 = ggplot(df, aes(x=rest.closed.flag, y=deaths.100k)) +
+  geom_point(position = position_jitter(width=0.1, height=0.1),
+             size=0.5)
+p4 = ggplot(df, aes(x=mask.mand.flag, y=deaths.100k)) +
+  geom_point(position = position_jitter(width=0.1, height=0.1),
+             size=0.5)
+grid.arrange(p1, p2, p3, p4, nrow=2, ncol=2)
+```
+A bit hard to tell, but there does appear to be a bit more variance in most categories among counties with no mandates. Also, the average deaths do appear to be slightly higher in counties with no stay-home orders or bar/restaurant mandates. And, appears the data for bars closed/restaurant closed flags might perfectly overlap, so one might need to be removed.
+
+How widespread were the mandates?
+```{r}
+### Bar/restaraunt order flags overlap perfectly, so I'll drop bars.closed
+mean((df$bars.closed.flag==df$rest.closed.flag))
+df = df %>% select(-c(bars.closed.flag))
+print(c(mean(df$mask.mand.flag),
+      mean(df$stay.home.flag),
+      mean(df$rest.closed.flag)))
+```
+
+Let's take a closer look at the distribution of each continuous predictor.
+```{r, message=F, warning=F}
+predictors.cont = c('pop.density', 'hisp.latino.pct', 'black.pct',
+                    'native.pct', 'median.age', 'median.income', 'pct.public.transpo',
+                    'high.risk.job', 'mask.frequent', 'R.pres.margin', 'health.condition',
+                    'avg.temp', 'mask.mand.days', 'stay.home.days',
+                    'bars.closed.days', 'rest.closed.days')
+
+plots = vector('list', length(predictors.cont))
+i=0
+for (pred in predictors.cont){
+  i = i+1
+  plots[[i]] = ggplot(df, aes_string(x=pred)) + geom_histogram()
+}
+grid.arrange(grobs=plots[1:9], nrow=3, ncol=3)
+```
+
+```{r, message=F, warning=F}
+grid.arrange(grobs=plots[10:16], nrow=3, ncol=3)
+```
+
+Some skewed distributions here (and also some discontinuity within some distributions). Before making transformations, let's look at the relationships between the (square-root transformed) response and continuous predictors.
+```{r, warning=FALSE, message=FALSE}
+df$sqrt.deaths = sqrt(df$deaths.100k)
+plots = vector('list', length(predictors.cont))
+i=0
+for (pred in predictors.cont){
+  i = i+1
+  plots[[i]] = ggplot(df, aes_string(x=pred, y='sqrt.deaths')) +
+                  geom_point(size=0.1, alpha=0.5) + geom_smooth()
+}
+grid.arrange(grobs=plots[1:9], nrow=3, ncol=3)
+```
+
+```{r, message=F, warning=F}
+grid.arrange(grobs=plots[10:16], nrow=3, ncol=3)
+```
+
+Based on all the plots seen so far, it seems like many variables should at least be evaluated for transformations.
+```{r, message=F, warning=F}
+bc = powerTransform(cbind(deaths.100k, pop.density, hisp.latino.pct,
+        black.pct, native.pct, median.age, median.income, high.risk.job,
+        mask.frequent, pct.public.transpo, R.pres.margin, avg.temp,
+        health.condition)~1, data=df,
+        family='yjPower') ### using yj since some vars not strictly positive
+summary(bc)
+```
+The above summary has some straightforward recommendations, but also several others that would produce unintuitive, confusing interpretations (in some cases reversing the direction of a relationship, such as with pct.public transpo). I'll include the following transformations:
+
+* square-root transformation of the response (deaths.100k)
+* log transformations of population density, Hispanic/Latino population pct, Black pct., and median income.
+
+I'm hesitant to apply unintuitive transformations to some of the variables that I'd like to test later on (i.e. bars closed days).
+
+To take a look again at scatter plots, but with transformed predictors:
+```{r, warning=FALSE, message=FALSE}
+p1 = ggplot(df, aes(x=log(pop.density), y=sqrt(deaths.100k))) +
+  geom_point(size=0.1, alpha=0.5) + geom_smooth(method='lm')
+p2 = ggplot(df, aes(x=log(hisp.latino.pct), y=sqrt(deaths.100k))) +
+  geom_point(size=0.1, alpha=0.5) + geom_smooth(method='lm')
+p3 = ggplot(df, aes(x=log(black.pct), y=sqrt(deaths.100k))) +
+  geom_point(size=0.1, alpha=0.5) + geom_smooth(method='lm')
+p4 = ggplot(df, aes(x=log(native.pct), y=sqrt(deaths.100k))) +
+  geom_point(size=0.1, alpha=0.5) + geom_smooth(method='lm')
+grid.arrange(p1,p2,p3,p4, nrow=2, ncol=2)
+```
+A concern with the last plot, for the Native American share of the population, is that while there isn't much overall trend here, in counties with very high Native American populations, nearly all death rates values are above the linear trend line.
+
+An additional concern I had with the prior median income plot was that while there appeared to be no trend below a certain income level, but at higher incomes, the slope clearly became negative. If we repeat the original plot using the untransformed incomes split  at $55k, we can see there are completely different slopes
+```{r, message=F, warning=F}
+p1 = ggplot(df %>% filter(median.income <55000), aes(x=median.income,
+      y=sqrt(deaths.100k))) +geom_point(size=0.1, alpha=0.5) +
+  geom_smooth()
+p2 = ggplot(df %>% filter((median.income > 55000)), aes(x=median.income,
+      y=sqrt(deaths.100k))) +geom_point(size=0.1, alpha=0.5) +
+  geom_smooth()
+grid.arrange(p1,p2, nrow=1, ncol=2)
+
+### Therefore, we will test using a "high income" flag
+df$higher.income = ifelse(df$median.income >= 55000, 1,0)
+```
+
+One very unevenly distributed variable is pct. public transportation usage. Because the vast majority of counties have zero or a negligible rate of public transportation use, it doesn't really make sense to use it as a continuous variable. But if the variable is then binned by ranges of use, the numbers would suggest that lower rates of usage are associated with higher COVID death rates than all but one county with high usage. Because this doesn't make much intuitive sense and there are likely many other variables influencing higher rates in areas without public transportation, I'm going to exclude this variable moving forward.
+```{r}
+df %>% mutate(pct.public.transpo.bin = cut_interval(pct.public.transpo, n=7)) %>%
+  group_by(pct.public.transpo.bin) %>%
+  summarize(mean(deaths.100k), median(deaths.100k), n())
+```
+Pct. Native American has a similar issue. Very few counties have sizable populations, but of the handful that do, deaths are markedly higher. Instead of using it as a continuous variable, I'll bin it into a factor.
+```{r}
+df %>% mutate(pct.native.bin = cut_interval(native.pct, 3)) %>%
+  group_by(pct.native.bin) %>%
+  summarize(mean(deaths.100k), median(deaths.100k), n())
+
+### add the above bin into the df
+df = df %>% mutate(pct.native.bin = cut_interval(native.pct, 3))
+```
+
+## Establishing a baseline mixed effects model
+I'm interested in first tying to appropriately specify a linear mixed effects model that used state (and possibly county class) as a random effect and variables uninfluenced by COVID as fixed effects. I will then conduct a series of tests to determine significance of additional COVID-related variables, such as mandates, duration of mandates, and partisan political preference.
+
+(NOTE: I Initially proposed to also use a Poisson rate model -- however, the large range of the offset parameter, population, created challenges that prevented the model from being able to converge. Similar problems were encountered when trying to fit a Poisson mixed effects model (using glmer), so both approaches are not implemented here.
+
+### Plot potential random effects
+Deaths clearly vary by state, so it seems this will be a useful effect to consider. I'm not sure there's quite as much apparent variance in county classes, but it's still worth considering as an effect.
+```{r, message=F, warning=F}
+p1 = ggplot(df, aes(x=STATE, y=deaths.100k)) +
+  geom_point(position = position_jitter(width=0.1, height=0.1),
+             size=0.5)
+p2 = ggplot(df, aes(x=county.class, y=sqrt(deaths.100k))) +
+  geom_point(position = position_jitter(width=0.1, height=0.1), size=0.5)
+grid.arrange(p1, p2, nrow=1, ncol=2)
+```
+
+In a null model with only an intercept, let's test some of the random effects to get a better sense of whether they're worth considering in a larger model.
+```{r, message=F, warning=F}
+m.state = lmer(sqrt(deaths.100k)~1+(1|STATE),data=df)
+m.county = lmer(sqrt(deaths.100k)~1+(1|county.class),data=df)
+m.state.county = update(m.county, .~. + (1|STATE))
+
+### first, test for state
+exactRLRT(m.state, m.state.county, m.county)
+### then for county class
+exactRLRT(m.county, m.state.county, m.state)
+```
+When added to a model containing only an intercept, both random effects appear significant.
+
+### Establish baseline model
+The primary variables whose significance I'm interested in testing are:
+
+* mask mandates
+* length of mask mandates
+* partisan political preference
+* stay at home orders
+* length of stay at home orders
+* bar/restaurant closings
+* length of bar/restaurant closings
+* self-reported mask usage
+
+To test these variables I'll begin by comparing their influence to a baseline model that considers variables that would not have been influenced by COVID:
+
+* population density
+* race and ethnicity
+* median age
+* median income
+* high risk job
+* share of population with underlying health conditions
+* average temperature
+
+Because we're using grouped data and the populations of counties vary widely, I at first tried to use population as weights. However, as can be seen below, the huge range for population seems to create issues and the model either won't converge or produces a singular fit (depending on which variables are added/removed. I couldn't find a combination that eliminated this issue.) Shrinking the scale of the weights by applying the same response transformation (square root) eliminated the error, but I couldn't locate a theoretical basis for doing this and was not confident it was an appropriate choice, so I decided not to proceed with it. Needless to say, not applying weights in what is essentially an ecological regression situation is problematic in itself, but I could find a way to appropriately incorporate them.
+```{r}
+m.base = lmer(sqrt(deaths.100k)~avg.temp+
+                health.condition+
+                high.risk.job+
+                log(median.income)*higher.income+
+                log1p(black.pct)+
+                pop.density+
+                log1p(hisp.latino.pct)+
+                pct.native.bin+
+                median.age+
+                (1|STATE)+(1|county.class),
+                weights=population,
+              data=df)
+```
+
+Same model as above, but with no weights:
+```{r}
+m.base = lmer(sqrt(deaths.100k)~avg.temp+
+                health.condition+
+                high.risk.job+
+                log(median.income)*higher.income+
+                log1p(black.pct)+
+                pop.density+
+                log1p(hisp.latino.pct)+
+                pct.native.bin+
+                median.age+
+                (1|STATE)+(1|county.class),
+              data=df)
+sumary(m.base)
+```
+
+The below plots shows that residuals are normally distributed, for the most part, though they have some mild heteroscedasticity. However, there is an odd diagonal at the bottom of the plot, all of boundary points in which counties had zero deaths. If I take a look closer, 11 of 13 zero-death points had fewer than 1200 people, and were among the 15 least populous counties in the data set. The other two still had fewer than 6,000 people. If we look closer at diagnostics (below, there aren't any overly influential points, based on Cook's distances, but there are some outliers). Because random effects models are particularly sensitive to outliers (Faraway, p. 211), I'd prefer not to leave these unadressed.
+```{r}
+plot(fitted(m.base), resid(m.base), cex=0.3)
+qqnorm(resid(m.base))
+```
+
+```{r}
+influenceIndexPlot(m.base)
+outlierTest(m.base)
+```
+Two of the above outliers have zero deaths, and one has four, though its very small population causes it's deaths/100k rate to be extreme.
+```{r}
+df %>% slice(930, 805, 691) %>%
+  dplyr::select(STATE, COUNTY, population, deaths, deaths.100k) %>%
+  arrange(population)
+```
+
+If we update the above model to exclude the outliers (above), it reveals two new ones, including another very small county with zero deaths. I'll spare you the tedium, but if I were to continue down this path, each time an additional one is removed, another 1-3 outliers is revealed -- nearly all of them small counties with zero deaths.
+```{r}
+m.base.noOutliers = update(m.base, subset=-c(930, 805, 691))
+outlierTest(m.base.noOutliers)
+```
+
+If we take a closer look at 16 counties under 1,200 people, which only represent a little over 1 percent of the data set, 12 are boundary points or outliers (11 zeroes and one four). 
+```{r}
+df %>% filter(population <=1200) %>%
+  dplyr::select(STATE, COUNTY, deaths, population, deaths.100k)
+```
+Rather than cherry pick outliers, I'll experiment with limiting the volatility caused by the least populous counties by fitting the model without observations with fewer than 1200 people, which still preserves nearly 99 percent of the data.
+```{r}
+m.base = update(m.base, data=df %>% filter(population >=1200))
+plot(fitted(m.base), resid(m.base), cex=0.3)
+qqnorm(resid(m.base))
+```
+The residual and QQ-norm plots are both improved.
+
+Take a closer look at the random effects in the baseline model.
+```{r}
+## The random effects aren't perfectly normally distributed, 
+## but they're not overly concerning
+par(mfrow=c(1,2))
+qqnorm(ranef(m.base)$STATE[[1]])
+qqnorm(ranef(m.base)$county.class[[1]])
+```
+
+If we look at the confidence intervals (below), the effects for state clearly still seem significant. Not the case for county class, whose effects are quite small. Because I'm curious whether the effects are more relevant when new variables are added to the model, I'll opt to keep it in models moving forward.
+```{r}
+dotplot(ranef(m.base), condVar=TRUE)
+```
+
+When the confidence intervals for fixed and random effects are bootstrapped, it is again apparent that the county class effect (sig02) is on the boundary and likely not significant. In this base model, several of the fixed effects do not appear to be significant (i.e. average temperature and the log-transformed pct. Hispanic/latino predictor), but I'd still like to include them since excluding them could affect the estimates for the variables I'm interested in testing. The interaction between income and the higher income factor appears to be influential.
+```{r, warning=F, message=F}
+confint(m.base, method='boot')
+```
+
+## Test predictors of interest
+Start by testing presidential vote preference. According to the Kenward Roger adjusted F-test, adding this to the base model is an improvement. 
+```{r, warning=F, message=F}
+m.pres = update(m.base, .~. + R.pres.margin)
+KRmodcomp(m.pres, m.base)
+
+# check residuals. Not much different than before. Nothing too concerning.
+plot(fitted(m.pres), resid(m.pres), cex=0.3)
+qqnorm(resid(m.pres))
+```
+Compared to the base model, does reported mask usage improve the model? According to a Kenward Roger test, it does. 
+```{r, message=F, warning=F}
+m.mask.freq = update(m.base, .~.+mask.frequent)
+KRmodcomp(m.mask.freq, m.base)
+
+# Residuals look fine
+plot(fitted(m.mask.freq), resid(m.mask.freq), cex=.3)
+qqnorm(resid(m.mask.freq))
+```
+
+Does including the enactment (and not the duration, which is a separate variable) of bar and restaurant closures improve the model? According to the below Kenward Roger test, it does not. A test using parametric bootstrapping supports this.
+```{r, message=F, warning=F}
+m.rest.closed = update(m.base, .~.+rest.closed.flag)
+KRmodcomp(m.rest.closed, m.base)
+### since that p-value wasn't large, double-checking with PB test
+PBmodcomp(m.rest.closed, m.base) 
+```
+
+What about the duration of restaurant closures? Not significant, according to the below Kenward-Rogers and bootstrapping tests.
+```{r, message=F, warning=F}
+### since I'd argue you can't test this without including the binary
+### rest/bars closed flag, I'm updating the previous model and not m.base
+m.rest.closed.days = update(m.rest.closed, .~. + rest.closed.days)
+KRmodcomp(m.rest.closed.days, m.base)
+```
+
+What about the duration of bar closures? That doesn't improve the model either, per the below tests.
+```{r, warning=F, message=F}
+m.bars.closed.days = update(m.rest.closed, .~. + bars.closed.days)
+KRmodcomp(m.bars.closed.days, m.base)
+```
+
+What about stay-at-home orders (the enactment, not the the duration, which is a separate variable)? That doesn't improve the model either, per the below tests.
+```{r, message=F, warning=F}
+m.stay.order = update(m.base, .~. + stay.home.flag)
+KRmodcomp(m.stay.order, m.base)
+PBmodcomp(m.stay.order, m.base)
+```
+
+What about the length of the stay-at-home orders? That does not improve the model according to the below test.
+```{r, message=F, warning=F}
+### since I'd argue you can't test this without including the binary
+### stay at home flag, I'm updating the previous model and not m.base
+m.stay.order.days = update(m.stay.order, .~. + stay.home.days)
+KRmodcomp(m.stay.order.days, m.base)
+```
+
+What about mask mandates (the establishing of them, not the duration?). That did not improve the model, according to the below tests.
+```{r, message=F, warning=F}
+m.mask.mand = update(m.base, .~. + mask.mand.flag)
+KRmodcomp(m.mask.mand, m.base)
+```
+
+What about the duration of the mask mandates? Did not improve the model, per the below tests.
+```{r, message=F, warning=F}
+m.mask.mand.days = update(m.mask.mand, .~. + mask.mand.days)
+KRmodcomp(m.mask.mand.days, m.base) 
+```
+
+From the above tests, only two variables, partisan vote preference and frequency of mask use, were significant improvements over a baseline model. Is a model that includes both an improvement over a model that only includes vote preference? Not according to the below tests.
+```{r, message=F, warning=F}
+m.pres.mask = update(m.pres, .~. + mask.frequent)
+KRmodcomp(m.pres.mask, m.pres)
+PBmodcomp(m.pres.mask, m.pres)
+```
+
+What about when compared to a model that only contains mask frequency?
+```{r, message=F, warning=F}
+KRmodcomp(m.pres.mask, m.mask.freq)
+```
+
+Adding presidential preference over a model that only contains mask frequency is clearly an improvement. So then if presidential vote preference clearly should be included, is mask frequency still significant?
+```{r, message=F, warning=F}
+# If we look at AIC, a model with vote preference and mask frequency actually
+# has a higher value than if just including vote preference.
+print(AIC(m.pres.mask, m.pres, m.mask.freq))
+
+### Let's bootstrap the confidence intervals for effects to look more closely
+### at mask frequency.
+confint(m.pres.mask, method='boot')
+```
+Mask frequency does not appear to be significant according to the above 95% interval. Additionally, since the AIC for a model with only voter preference is lower than a model that also contains mask frequency, it seems likely that only presidential vote preference provides a significant improvement over the baseline set of predictors.
+
+## Model selection
+Another approach to identifying a model would be to use stepwise model selection. I couldn't figure out a way to implement stepwise using a mixed-effects model, but a manual, somewhat tedious equivalent of forward stepwise is implemented below. Since we already know that partisan vote preference was an improvement in AIC over the base model, that will serve as my starting point. (I'm also skipping the next predictor, mask usage since I know the AIC for that was lower than in the model with partisan preference)
+```{r}
+fm.1 = update(m.pres, .~. + rest.closed.flag)
+AIC(m.pres, fm.1) # rest.closed.flag is an improvment
+
+fm.2 = update(fm.1, .~. + rest.closed.days)
+AIC(fm.1, fm.2) # not an improvment
+
+fm.3 = update(fm.1, .~. + bars.closed.days)
+AIC(fm.1, fm.3) # not an improvment
+
+fm.4 = update(fm.1, .~. + stay.home.flag)
+AIC(fm.1, fm.4) # improvment
+
+fm.5 = update(fm.4, .~. + stay.home.days)
+AIC(fm.4, fm.5) # not an improvment
+
+fm.6 = update(fm.4, .~. + mask.mand.flag)
+AIC(fm.4, fm.6) # improvment
+
+fm.7 = update(fm.6, .~. + mask.mand.days)
+AIC(fm.6, fm.7) # not an improvement
+```
+
+That process added three additional variables: the binary flags for restaurant/bar closures, stay-at-home orders and mask mandates. Interestingly, AIC did not select any of the variables measuring how long those orders lasted. All three of these binary variables are highly correlated since states and counties that issued one type of mandate were likely to issue another. If we look at the below bootstrapped confidence intervals for the effects, one of them, the stay-at-home order, doesn't appear to be significant, and another, mask mandates, presents the unintuitive conclusion that mask mandates are associated with higher death rates. Ultimately, because the results of this conflict a bit with the results of the model comparisons using Kenward Rogers and parametric bootstrapping, I'd be quite hesitant to conclude that the mandates are influential. Doubly so since stepwise model selection didn't find the length of those mandates to be meaningful.
+```{r, warning=F, message=F}
+confint(fm.6, method='boot')
+```
+
+Below are the bootstrapped confidence intervals for the effects in the model that only added partisan vote preference to the baseline model:
+```{r, warning=F, message=F}
+confint(m.pres, method='boot')
+```
+In the above output, the square root transformation of the response makes one-unit changes in the predictors challenging to explain, but the following predictors appear do appear to be significant:
+
+* population density (positively associated with death rate)
+* Hispanic/Latino share of the population (positively associated with death rate)
+* Native American shares of county populations were binned, but the factors for the 2nd and 3rd levels (corresponding to 30-60% and 60-90%, respectively) were significant, and positively associated with death rate.
+* Median age (positively associated with death rate).
+* Republican presidential vote preference (positively associated whit death rate).
+* The interaction between (log-transformed) median household income and a factor for "higher" income (meaning $57K and up) was negatively associated with death rate.
+
+To take a closer look at the random effects, the confidence intervals for each state demonstrate that the state effect is still clearly significant. The effect for South Dakota, whose COVID outbreak was well-documented last year, last the largest positive effect of any state. And in a change from previously, the very smallest class, for rural areas with fewer than 2,500 people, appears to be influential.
+```{r}
+dotplot(ranef(m.pres))
+
+## If we repeat our tests for random effects that were initially
+## done on the null model, state is still clearly significant,
+## but county class is not (though it's p-value is almost borderline)
+m.1.state.only  = update(m.pres, .~. - (1|county.class))
+m.1.county.only  = update(m.pres, .~. - (1|STATE))
+exactRLRT(m.1.state.only, m.pres, m.1.county.only)
+exactRLRT(m.1.county.only, m.pres, m.1.state.only)
+```
+
+## Random Forest model
+Another approach to modeling this problem that could help account for some of the non-linearity and discontinuities present in the variables is a random forest model. In this scenario, I'm more interested in understanding feature importance rather than being able to make accurate predictions on an unseen test data set. To get a sense of which variables might be influential in explaining COVID death rates, I'm first going to perform cross-validation to determine how many variables should be included in the sub-sample of predictors, and then fit a model on the entire dataset using the optimal parameter chosen by cross-validation
+```{r}
+### removing unnneeded or artificial vars
+tree.df = df %>%
+  select(-c(COUNTY, higher.income, sqrt.deaths, population, pct.native.bin, deaths))
+
+X1 = tree.df %>% select(-c(deaths.100k))
+y1 = tree.df$deaths.100k
+m.rf = rfcv(X1, y1, step = 0.9)
+### look at the CV error for different levels of nvars
+cbind(nvars=m.rf$n.var,MSE=m.rf$error.cv)
+```
+
+NOTE (The number selected for the nvar parameter was not consistent each time this document was compiled (setting the seed worked in my local environment, but not with knitr). I have chosen 17 because it was the most frequent outcome in the handful of times I ran this.)
+```{r}
+### apply the value with the lowest MSE to mtry and fit on full dataset
+fmod = randomForest(X1, y1, mtry=17, importance=TRUE)
+import = importance(fmod) %>%
+  as.data.frame()
+import = import %>% mutate(predictor=rownames(import))
+
+ggplot(import, aes(y=reorder(predictor, IncNodePurity, sum), x=IncNodePurity)) +
+  geom_col()
+```
+
+The random forest model found that state (which I'd prefer the random effect interpretation of since I'm not so much trying to estimate its effect as account for it's variance.), population density, presidential vote preference, median age, high-risk jobs and underlying health conditions were the most important features. Many of the mandate-related variables were found to be fairly unimportant.
+
+If we re-run the above without state and county class (below), the feature importance changes a bit. While I prefer the random effects interpretation of those variables, with a tree-based model, I'd argue it's important they still be included as predictors and that it's not appropriate to exclude them.
+```{r}
+X2 = tree.df %>% select(-c(deaths.100k, STATE, county.class))
+y2 = tree.df$deaths.100k
+## then split into train/test
+m.rf2 = rfcv(X2, y2, step = 0.9)
+
+### look at the CV error for different levels of nvars
+cbind(nvars=m.rf2$n.var,MSE=m.rf2$error.cv)
+
+### That recommends leaving 17 again for mtry
+fmod2 = randomForest(X2, y2, mtry=17, importance=TRUE)
+importance(fmod2) %>%
+  as.data.frame() %>%
+  arrange(desc(IncNodePurity))
+```
+\newpage
+# About the data
+(Hover over descriptions for links to sources.)
+
+The following county-level datasets were dowloaded from the U.S Census Bureau 
+County-level statistics containing population, income, age, occupation breakdowns, were downloaded [from the U.S. Census Bureau](https://data.census.gov/cedsci/):
+
+* Population
+* Land area (used to calculated population density)
+* Hispanic or Latino population
+* Black population
+* Native American population
+* Median household income
+* Median age
+* Share of residents riding public transporation
+* Share of residents working in high-risk occupations (defined as the below categories, which were highlighted by [this UC-San Francisco study of California excess deaths](https://www.medrxiv.org/content/10.1101/2021.01.21.21250266v1.full.pdf) )
+  + Food preparation and serving related occupations
+  + Production, transportation, and material moving occupations
+  + Construction and extraction
+  + Installation, maintenane and repair occupations
+
+[County classification codes (AKA Rural-Urban Continuum Codes), were downloaded from https://www.ers.usda.gov/data-products/rural-urban-continuum-codes.aspx](the USDA.)
+
+[The self-relported share of residents who "always" or "frequently" wear a mask was made available by the New York Times.](https://github.com/nytimes/covid-19-data/tree/master/mask-use)
+
+[Covid death statistics were downloaded from the New York Times](https://github.com/nytimes/covid-19-data).
+
+[County-lelel election results were scraped from the unofficial NYT elections API using this scraper](https://github.com/ChasManRors/USElection2020-NYT-Results).
+
+[County-level statistics on residents' underlying health conditions came from the CDC](https://stacks.cdc.gov/view/cdc/90519)
+
+[Average temperature data from April 2020-March 2021 came from NOAA](https://www.ncdc.noaa.gov/cag/county/mapping/110/tavg/202103/12/value)
+
+Data for the following statistics was downloaded from the CDC:
+
+* [Stay at home orders](https://www.cdc.gov/mmwr/volumes/69/wr/mm6935a2.htm)
+* [Mask mandates](https://data.cdc.gov/Policy-Surveillance/U-S-State-and-Territorial-Public-Mask-Mandates-Fro/62d6-pm5i)
+* [Restaraunt closures](https://data.cdc.gov/Policy-Surveillance/U-S-State-and-Territorial-Orders-Closing-and-Reope/azmd-939x)
+* [Bar closures](https://data.cdc.gov/Policy-Surveillance/U-S-State-and-Territorial-Orders-Closing-and-Reope/9kjw-3miq)

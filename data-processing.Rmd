@@ -1,0 +1,606 @@
+---
+title: "COVID county-level data processing"
+author: "Walker Moskop"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(car)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(foreign)
+library(stringr)
+library(jsonlite)
+library(purrr)
+library(janitor)
+library(readr)
+library(jsonlite)
+
+```
+
+# Gather data
+## Retrieve county-level deaths from NYT GitHub
+```{r}
+data_dir = 'data/'
+
+url = "https://raw.githubusercontent.com/nytimes/covid-19-data/master/live/us-counties.csv"
+covid.raw = read.csv(url)
+head(covid.raw,1)
+### group by county
+covid = covid.raw %>%
+  group_by(fips) %>%
+  summarise(deaths=sum(deaths))
+
+## split fips into county/state
+covid$fips = str_pad(covid$fips, 5, pad='0')
+covid$STATE = as.numeric(substr(covid$fips, 1, 2))
+covid$COUNTY = as.numeric(substr(covid$fips, 3,5))
+head(covid,1)
+
+# select only necessary columns and exclude us territories
+covid = covid %>%
+  select(STATE, COUNTY, deaths) %>%
+  filter(STATE <=56)
+## any nulls?
+sum(is.na(covid))
+```
+
+## Read in population data
+```{r}
+pop.raw = read.csv(paste0(data_dir, 'us-county-population.csv'))
+pop = pop.raw %>%
+  ## filter to 2019
+  filter(DATE_CODE=='7/1/2019 population estimate') %>%
+  ## parse out state, county fips
+  mutate(STATE=as.numeric(substr(GEO_ID, 10,11))) %>%
+  mutate(COUNTY=as.numeric(substr(GEO_ID, 12,14))) %>%
+  select(STATE, COUNTY, POP)
+head(pop,1)
+```
+
+## Create function for reading in and processing the rest of the Census data
+```{r}
+process.census = function(df, select.cols, return.cols){
+  ## isolate only relevant columns
+  df = df %>%
+    select(all_of(select.cols))
+  ## rename columns and drop first row (which is just header descriptions)
+  colnames(df) = c('GEO_ID', return.cols)
+  df = df[2:nrow(df),]
+  
+  ## split GEO_ID into state and county codes
+  df$STATE = as.numeric(substr(df$GEO_ID, 10, 11))
+  df$COUNTY = as.numeric(substr(df$GEO_ID, 12, 14))
+  
+  ### reorder columns and remove GEO_ID
+  df = df[, c(c('STATE', 'COUNTY'), return.cols)]
+  
+  ## set variables to be numeric
+  df = df %>% mutate_if(is.character, as.numeric)
+  return(df)
+}
+```
+ 
+## Read in and process Race and ethnicity data
+```{r}
+race.eth.raw = read.csv(paste0(data_dir, 'us-county-race-ethnicity.csv'))
+race.eth.incols = c('GEO_ID', 'DP05_0071PE', 'DP05_0078PE', 'DP05_0079PE')
+race.eth.outcols = c('hisp.latino.pct','black.pct', 'native.pct')
+race.eth = process.census(race.eth.raw, select.cols = race.eth.incols,
+                    return.cols = race.eth.outcols)
+
+str(race.eth)
+head(race.eth,1)
+
+## any nulls
+sum(is.na(race.eth))
+```
+
+## Read in and process age data
+```{r}
+age.raw = read.csv(paste0(data_dir, 'us-county-median-age.csv'))
+age.incols = c('GEO_ID', 'B01002_001E')
+age.outcols = c('median.age')
+age = process.census(age.raw, select.cols = age.incols,
+                    return.cols = age.outcols)
+
+str(age)
+head(age,1)
+
+## any nulls?
+sum(is.na(age))
+```
+
+## Read in and process income data
+```{r}
+income.raw = read.csv(paste0(data_dir, 'us-county-income.csv'))
+income.incols = c('GEO_ID', 'S1901_C01_012E')
+income.outcols = c('median.income')
+income = process.census(income.raw, select.cols = income.incols,
+                    return.cols = income.outcols)
+
+str(income)
+head(income,1)
+
+## any nulls?
+sum(is.na(income))
+```
+
+## Read in and process transporation data
+```{r}
+transpo.raw = read.csv(paste0(data_dir, 'us-county-commuting.csv'))
+transpo.incols = c('GEO_ID', 'S0801_C01_009E')
+transpo.outcols = c('pct.public.transpo')
+transpo = process.census(transpo.raw, transpo.incols, transpo.outcols)
+str(transpo)
+head(transpo,1)
+
+## any nulls?
+sum(is.na(transpo))
+```
+
+
+## Read in uninsured data
+```{r}
+uninsured.raw = read.csv(paste0(data_dir, 'us-county-uninsured.csv'))
+uninsured.incols = c('GEO_ID', 'S2701_C04_001E', 'S2701_C01_001E')
+uninsured.outcols = c('uninsured', 'population')
+uninsured = process.census(uninsured.raw, uninsured.incols, uninsured.outcols)
+head(uninsured, 1)
+
+### calculate pct uninsured and remove num/denom cols
+uninsured = uninsured %>%
+  mutate(pct.uninsured = round(uninsured/population*100,2)) %>%
+  select(STATE, COUNTY, pct.uninsured)
+
+str(uninsured)
+head(uninsured,1)
+
+## any nulls?
+sum(is.na(uninsured))
+```
+
+## Read in county land area (for calculating pop. density)
+```{r}
+geo.raw = read.dbf(paste0(data_dir, 'tl_2020_us_county.dbf'))
+str(geo.raw)
+
+### isolate only required columns
+geo = geo.raw %>%
+  select(STATEFP, COUNTYFP, ALAND) %>%
+  rename(STATE=STATEFP, COUNTY=COUNTYFP)
+
+## remove leading zeroes and set state and county as numeric
+geo$STATE = as.numeric(sub('^0+', '', geo$STATE))
+geo$COUNTY = as.numeric(sub('^0+', '', geo$COUNTY))
+
+head(geo,1)
+### any nulls?
+sum(is.na(geo))
+```
+
+## Join with population data and calculate density
+```{r}
+pop.and.geo = merge(pop, geo, by=c('COUNTY', 'STATE'), all.x = TRUE)
+nrow(pop.and.geo)
+head(pop.and.geo, 1)
+pop.and.geo %>% filter(is.na(ALAND))
+
+## impute missing sq m value (retreived from wikipedia for this
+## Alaskan census area)
+pop.and.geo = pop.and.geo %>%
+  mutate(ALAND=ifelse(is.na(ALAND), 104500000000, ALAND))
+
+### calculate density as pop sq. km
+pop.and.geo = pop.and.geo %>%
+  mutate(population=as.numeric(POP)) %>%
+  mutate(pop.density = population / (ALAND/1000000)) %>%
+  select(STATE, COUNTY, population, pop.density)
+
+pop.and.geo %>% filter(is.na(pop.density))
+
+head(pop.and.geo, 1)
+```
+
+## Read in data on higher-risk occupations
+Data filtered to the following occupational categories
+- Food preparation and serving related occupations
+- Production, transportation, and material moving occupations
+- Construction and extraction
+- Installation, maintenane and repair occupations
+```{r}
+## industries were chosen based on data from this study:
+## https://www.medrxiv.org/content/10.1101/2021.01.21.21250266v1.full.pdf
+# food/agriculture workers (39% increase),
+# transportation/logistics workers (28% increase),
+# facilities (27%) and
+# manufacturing workers (23% increase).
+
+occupation.raw = read.csv(paste0(data_dir, 'us-county-occupations.csv'))
+occupation.incols = c('GEO_ID', 'S2401_C01_001E', 'S2401_C01_023E',
+                    'S2401_C01_033E', 'S2401_C01_031E', 'S2401_C01_032E')
+occupation.outcols = c('population', 'food', 'prod', 'const', 'maint')
+occupation = process.census(occupation.raw, occupation.incols, occupation.outcols)
+head(occupation, 1)
+
+### calculate pct occupation and remove num/denom cols
+occupation = occupation %>%
+  mutate(high.risk.job = round((food+prod+const+maint)/population*100,2)) %>%
+  select(STATE, COUNTY, high.risk.job)
+
+str(occupation)
+head(occupation)
+
+## any nulls?
+sum(is.na(occupation))
+```
+
+
+## Read in and process mask use survey data
+```{r}
+mask.raw = read.csv('https://raw.githubusercontent.com/nytimes/covid-19-data/master/mask-use/mask-use-by-county.csv')
+
+head(mask.raw,1)
+
+## to simplify this dataset, creating a column for "mask.frequent" which will
+## be FREQUENTLY + ALWAYS
+mask = mask.raw
+mask$mask.frequent = round(mask$FREQUENTLY + mask$ALWAYS * 100,2)
+
+## parse COUNTYFP column into state and county
+## First must set as string
+mask$COUNTYFP = str_pad(mask$COUNTYFP, 5, pad="0")
+mask$STATE = as.numeric(substr(mask$COUNTYFP, 1, 2))
+mask$COUNTY = as.numeric(substr(mask$COUNTYFP, 3,5))
+## marrow to only relevant columns
+mask = mask %>%
+  select(STATE, COUNTY, mask.frequent)
+head(mask,1)
+
+## any nulls?
+sum(is.na(mask))
+```
+
+## Gather and process county-level presidential election results
+```{r}
+## The below code for scraping data from the NYT elections API is 
+## from https://github.com/ChasManRors/USElection2020-NYT-Results
+
+state_strings <- c("alaska", "texas", "minnesota", "michigan", "west-virginia",
+  "virginia", "wisconsin", "kentucky", "louisiana", "mississippi",
+  "missouri", "north-carolina", "california", "iowa", "maine",
+  "florida", "washington", "illinois", "north-dakota", "maryland",
+  "georgia", "tennessee", "new-york", "arkansas", "oklahoma", "nebraska",
+  "south-carolina", "idaho", "new-hampshire", "ohio", "south-dakota",
+  "vermont", "indiana", "pennsylvania", "montana", "kansas", "oregon",
+  "arizona", "alabama", "new-jersey", "hawaii", "massachusetts",
+  "nevada", "new-mexico", "colorado", "rhode-island", "wyoming",
+  "connecticut", "utah", "delaware", "district-of-columbia")
+
+get_county_dat <- function(x) {
+  print(x)
+  Sys.sleep(2)
+  time <- Sys.time()
+  json_url <- glue::glue("https://static01.nyt.com/elections-assets/2020/data/api/2020-11-03/race-page/{x}/president.json")
+  res <- jsonlite::fromJSON(json_url)
+  cleaned <- res[["data"]][["races"]][["counties"]][[1]]  %>%
+    rowwise() %>%
+    mutate(results = list(as.list(results)),
+           results_absentee = list(as.list(results_absentee)),
+           state = x,
+           retrieved_time = time) %>%
+    tidyr::unnest_wider(results, names_sep = "_")  %>%
+    tidyr::unnest_wider(results_absentee, names_sep = "_")  %>%
+    janitor::clean_names()
+  return(cleaned)
+}
+
+# election_results <- state_strings %>%
+#   map_dfr(get_county_dat)
+
+elex_dir = paste0(data_dir, 'elections')
+# dir.create(elex_dir)
+# write_csv(election_results,
+#           file = paste0(elex_dir, '/results_president.csv'))
+
+## if not retreiving data for first time, simpy read in file
+election_results.raw = read.csv(paste0(elex_dir, '/results_president.csv'))
+
+## Now calculate GOP vote margin pct.
+election_results = election_results.raw %>%
+  mutate(R.pres.margin = round((results_trumpd - results_bidenj)/votes*100, 2))
+
+## parse state/county fips codes
+election_results$fips = str_pad(as.character(election_results$fips), 5, pad='0')
+election_results$STATE = as.numeric(substr(election_results$fips, 1, 2))
+election_results$COUNTY = as.numeric(substr(election_results$fips, 3,5))
+
+### isolate to only relevant columns
+election_results = election_results %>%
+  select(STATE, COUNTY, R.pres.margin)
+head(election_results,1)
+
+## any nulls?
+sum(is.na(election_results))
+```
+
+## Read in underlying health condition data
+```{r}
+# retreived form https://stacks.cdc.gov/view/cdc/90519
+health.raw = read.csv(paste0(data_dir, 'us-county-underlying-conditions.csv'))
+
+## select only relevant columns
+health = health.raw %>% select(STATE_FIPS, CNTY_FIPS, anycondition_prevalence)
+
+## rename cols and set fips as ints
+colnames(health) = c('STATE', 'COUNTY', 'health.condition')
+str(health)
+head(health)
+
+## any nulls?
+sum(is.na(health))
+```
+
+## Read in county temperature data
+```{r}
+# retreived from https://www.ncdc.noaa.gov/cag/county/mapping/110/tavg/202103/12/value
+temps.raw = read.csv(paste0(data_dir, 'us-county-temperatures.csv'), skip=3)
+
+### select only relevant columns
+temps = temps.raw %>%
+  select(Location.ID, Value)
+
+## need to split Location into state/county fips
+head(temps,1)
+
+# read in fips lookup table
+state.fips = read.csv(paste0(data_dir, 'state-fips.csv'))
+head(state.fips)
+
+# split state into separate col in temps
+temps = temps %>%
+  separate(Location.ID, c('CODE', 'COUNTY'))
+
+## now merge in state fips
+nrow(temps)
+temps = merge(temps, state.fips, by='CODE')
+## shouldn't have affected row count
+nrow(temps)
+head(temps,1)
+
+## remove "CODE" and set state/county as numeric
+temps = temps %>%
+  select(STATE, COUNTY, Value) %>%
+  mutate_if(is.character, as.numeric) %>%
+  rename(avg.temp=Value)
+head(temps,1)
+
+## any nulls?
+sum(is.na(temps))
+```
+
+## Read in mask mandate data
+```{r}
+msk.mand.raw = read.csv(paste0(data_dir, 'us-county-mask-mandates.csv'))
+  
+### create 1/0 column for mask mandate in effect and sum days in effect
+### for each county
+msk.mand = msk.mand.raw %>%
+  mutate(mandate=ifelse(Current_order_status=='Public Mask Mandate',1,0)) %>%
+  group_by(FIPS_State, FIPS_County) %>%
+  summarize(mask.mand.days=sum(mandate)) %>%
+  mutate(mask.mand.flag = ifelse(mask.mand.days>0,1,0))
+
+colnames(msk.mand) = c('STATE', 'COUNTY', 'mask.mand.days', 'mask.mand.flag')
+head(msk.mand,1)
+
+## any nulls?
+sum(is.na(msk.mand))
+```
+
+## Read in stay-at-home order data
+```{r}
+stay.home.raw = read.csv(paste0(data_dir, 'us-county-stayhome-orders.csv'))
+
+## count mandatory all only
+stay.home = stay.home.raw %>%
+  mutate(stay.home=ifelse(grepl('Mandatory - all', County.Order.Status.),1,0)) %>%
+  group_by(stateFIPS, countyFIPS) %>%
+  summarize(stay.home.days=sum(stay.home)) %>%
+  mutate(stay.home.flag = ifelse(stay.home.days>0,1,0))
+
+colnames(stay.home) = c('STATE', 'COUNTY', 'stay.home.days', 'stay.home.flag')
+
+## change county fips code to exclude state code 
+stay.home$COUNTY = as.numeric(substr(str_pad(as.character(stay.home$COUNTY),
+                                             5, pad='0'), 3, 5))
+head(stay.home,1)
+## any nulls?
+sum(is.na(stay.home))
+```
+
+## Read in bar closings
+```{r}
+# https://data.cdc.gov/Policy-Surveillance/U-S-State-and-Territorial-Orders-Closing-and-Reope/9kjw-3miq
+bar.raw = read.csv(paste0(data_dir, 'us-county-bar-closings.csv'))
+
+## count days that closed or curbside only is in effect
+bar.closings = bar.raw %>%
+  mutate(bars.closed=ifelse((Current_order_status=='In effect') &
+                      grepl('Closed|Curbside', order_group), 1, 0)) %>%
+  group_by(FIPS_State, FIPS_County) %>%
+  summarize(bars.closed.days=sum(bars.closed)) %>%
+  mutate(bars.closed.flag = ifelse(bars.closed.days>0,1,0))
+
+colnames(bar.closings) = c('STATE', 'COUNTY', 'bars.closed.days', 'bars.closed.flag')
+
+## change county fips code to exclude state code 
+bar.closings$COUNTY = as.numeric(substr(str_pad(as.character(bar.closings$COUNTY),
+                                             5, pad='0'), 3, 5))
+head(bar.closings,1)
+## any nulls?
+sum(is.na(bar.closings))
+```
+
+## Read in restaraunt closings
+```{r}
+# https://data.cdc.gov/Policy-Surveillance/U-S-State-and-Territorial-Orders-Closing-and-Reope/azmd-939x
+rest.raw = read.csv(paste0(data_dir, 'us-county-restaraunt-closings.csv'))
+
+## count days that closed or curbside only is in effect
+rest.closings = rest.raw %>%
+  mutate(rest.closed=ifelse((Current_order_status=='In effect') &
+                      grepl('Closed|Curbside', order_group), 1, 0)) %>%
+  group_by(State_Tribe_Territory, FIPS_State, FIPS_County) %>%
+  summarize(rest.closed.days=sum(rest.closed)) %>%
+  mutate(rest.closed.flag = ifelse(rest.closed.days>0,1,0))
+
+colnames(rest.closings) = c('ST', 'STATE', 'COUNTY', 'rest.closed.days', 'rest.closed.flag')
+  
+## change county fips code to exclude state code 
+rest.closings$COUNTY = as.numeric(substr(str_pad(
+  as.character(rest.closings$COUNTY),5, pad='0'), 3, 5))
+head(rest.closings,1)
+## any nulls?
+sum(is.na(rest.closings))
+```
+
+## Merge the following datasets and write to file
+- covid
+- pop.and.geo
+- race.eth
+- age
+- income
+- transporation
+- high-risk occupations
+- mask use 
+- election results
+- health
+- temperature
+- mask mandates
+- stay at home orders
+- bar closings
+- restaraunt closings
+```{r}
+### A bit tedious, but going to join these one at a time to make
+## sure no records are lost
+n = nrow(covid)
+print(n)### should maintain this record count after each join, with no nulls
+final.df = merge(covid, pop.and.geo, by=c('STATE', 'COUNTY'))
+print(nrow(final.df)==n)
+sum(is.na(final.df))==0
+
+### calculate deaths/100000
+final.df = final.df %>%
+  mutate(deaths.100k = deaths / population * 100000)
+
+## race.eth
+final.df = merge(final.df, race.eth, by=c('STATE', 'COUNTY'))
+print(nrow(final.df)==n)
+sum(is.na(final.df))==0
+
+## age
+final.df = merge(final.df, age, by=c('STATE', 'COUNTY'))
+print(nrow(final.df)==n)
+sum(is.na(final.df))==0
+
+## income
+final.df = merge(final.df, income, by=c('STATE', 'COUNTY'))
+print(nrow(final.df)==n)
+sum(is.na(final.df))==0
+
+## transporation
+final.df = merge(final.df, transpo, by=c('STATE', 'COUNTY'))
+print(nrow(final.df)==n)
+sum(is.na(final.df))==0
+
+## high-risk occupations
+final.df = merge(final.df, occupation, by=c('STATE', 'COUNTY'))
+print(nrow(final.df)==n)
+sum(is.na(final.df))==0
+
+## mask use
+final.df = merge(final.df, mask, by=c('STATE', 'COUNTY'))
+print(nrow(final.df)==n)
+sum(is.na(final.df))==0
+
+## election results
+final.df = merge(final.df, election_results, by=c('STATE', 'COUNTY'))
+print(nrow(final.df)==n)
+## upon further inspection, the state of Alaska doesn't provide
+## election results at the county level. Since their election results
+## don't align with the rest of the data and this is likely a relevant
+## variable, I'm going to remove Alaska from the dataset.
+## update n
+n = nrow(final.df)
+print(n)
+sum(is.na(final.df))==0
+
+## health conditions
+final.df = merge(final.df, health, by=c('STATE', 'COUNTY'))
+print(nrow(final.df)==n)
+sum(is.na(final.df))==0
+
+## temperature
+final.df = merge(final.df, temps, by=c('STATE', 'COUNTY'), all.x = TRUE)
+print(nrow(final.df)==n)
+sum(is.na(final.df))==0
+
+## Appears dc was oddly coded in the weather data, so I'm manually adding in the
+## value from the file here. Also, Hawaii was not availabe in the dataset,
+## so I'm removing it.
+final.df = final.df %>%
+  filter(STATE != 15) %>%
+  mutate(avg.temp = ifelse(is.na(avg.temp),57.5, avg.temp))
+
+n = nrow(final.df)
+print(n)
+
+# mask mandates
+final.df = merge(final.df, msk.mand, by=c('STATE', 'COUNTY'))
+print(nrow(final.df)==n)
+sum(is.na(final.df))==0
+
+# stay home orders
+final.df = merge(final.df, stay.home, by=c('STATE', 'COUNTY'), all.x = TRUE)
+## one county in S. Dakota was missing. S. Dakota had no stay home order.
+final.df[is.na(final.df)] = 0
+
+print(nrow(final.df)==n)
+sum(is.na(final.df))==0
+
+# bar closings
+final.df = merge(final.df, bar.closings, by=c('STATE', 'COUNTY'))
+print(nrow(final.df)==n)
+sum(is.na(final.df))==0
+
+# restaraunt closings
+final.df = merge(final.df, rest.closings, by=c('STATE', 'COUNTY'))
+print(nrow(final.df)==n)
+sum(is.na(final.df))==0
+
+## join in county size/metro classifications
+# https://www.ers.usda.gov/data-products/rural-urban-continuum-codes.aspx
+county.codes.raw = read.csv(paste0(data_dir, 'rural-urban-county-codes.csv'))
+nrow(county.codes.raw)
+### split fips into state/county fips
+county.codes = county.codes.raw %>%
+  mutate(STATE = as.numeric(substr(str_pad(FIPS, 5, pad='0'), 1, 2)),
+         COUNTY = as.numeric(substr(FIPS, 3, 5))) %>%
+  select(STATE, COUNTY, RUCC_2013) %>%
+  rename(county.class=RUCC_2013)
+
+### merge with final.df
+final.df = merge(final.df, county.codes, by=c('STATE', 'COUNTY'))
+
+# set STATE to ST, drop st and write to csv
+final.df = final.df %>%
+  mutate(STATE=ST) %>%
+  select(-ST)
+
+write.csv(final.df, paste0(data_dir, 'county-all-data.csv'), row.names = FALSE)
+```
