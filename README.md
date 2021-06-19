@@ -2,7 +2,7 @@
 An analysis of COVID fatality rates in Midwestern counties
 
 # Overview
-The analysis markdown file (and corresponding HTML output) in this repository contains an analysis of county-level COVID-19 fatality rates in Midwestern states conducted for an advanced linear modeling graduate course at Indiana University. The analysis primarily uses linear mixed effects models (and tests applied to those models) to identify whether various government mandates (including their duration), reported mask usage, and partisan political preference could explain variation in COVID death rates between counties.
+The analysis markdown file (and corresponding pdf output) in this repository contains an analysis of county-level COVID-19 fatality rates in Midwestern states conducted for an advanced linear modeling graduate course at Indiana University. The analysis primarily uses linear mixed effects models (and tests applied to those models) to identify whether various government mandates (including their duration), reported mask usage, and partisan political preference could explain variation in COVID death rates between counties.
 
 The data-processing.Rmd file reads in and merges the following county-level datasets, which are then used for the analysis:
 * COVID deaths
